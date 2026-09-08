@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         linux.do 话题自动浏览（蓝点刷帖 v2）
 // @namespace    https://linux.do/
-// @version      0.11.2
+// @version      0.11.3
 // @description  只在“待阅”话题行上工作（新话题蓝点 tr.unseen-topic / .topic-post-badges .new-topic，或新回复未读徽章 .unread-posts）：打开话题标签并切过去，下滑固定距离读一段就退出，再回列表等标记消失+间隔后才开下一个；不对同一话题重复进入，未消失的交给下一轮列表循环（列表到底即切下一个 URL）。在 /latest、/new、/unseen 三个列表间自动轮换（/new 空刷 1 次、其余 5 次后触发“无内容休眠”，休眠 5 分钟倒计时，期间可点“开始/取消休眠”立即恢复，到期自动切列表）。
 // @author       you
 // @match        https://linux.do/*
@@ -9,6 +9,7 @@
 // @noframes
 // @grant        GM_openInTab
 // @grant        GM_registerMenuCommand
+// @license      MIT
 // ==/UserScript==
 
 /* =====================================================================
