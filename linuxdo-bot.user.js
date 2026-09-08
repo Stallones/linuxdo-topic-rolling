@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         linux.do 话题自动浏览（蓝点刷帖 v2）
 // @namespace    https://linux.do/
-// @version      0.8.0
-// @description  只在带未读蓝点(unseen-topic / .topic-post-badges .new-topic)的话题行上工作：打开话题标签并切过去等数据加载，再回列表等蓝点消失+间隔后才开下一个；蓝点未消失则回该话题多下滑一段再回来。在 /latest、/new?subset=topics、/unseen 三个列表间每 10 分钟自动轮换。
+// @version      0.10.0
+// @description  只在“待阅”话题行上工作（新话题蓝点 tr.unseen-topic / .topic-post-badges .new-topic，或新回复未读徽章 .unread-posts）：打开话题标签并切过去等数据加载，再回列表等标记消失+间隔后才开下一个；未消失则回该话题多下滑一段再回来。在 /latest、/new、/unseen 三个列表间自动轮换（/new 空刷 1 次、其余 5 次后触发“无内容休眠”，休眠 5 分钟倒计时，期间可点“开始/取消休眠”立即恢复，到期自动切列表）。
 // @author       you
 // @match        https://linux.do/*
 // @run-at       document-idle
@@ -13,8 +13,9 @@
 
 /* =====================================================================
  * 纯页面行为，不判断登录。同脚本两角色靠 localStorage 协作：
- *   - 调度者：运行在三个列表页之一，只处理带小蓝点(unseen-topic)的行；
- *             轮换 URL；打开/关闭话题标签；等蓝点消失。
+ *   - 调度者：运行在三个列表页之一，只处理带“待阅”标记的行(新话题
+ *             unseen-topic / .new-topic 或 新回复 .unread-posts)；
+ *             轮换 URL；打开/关闭话题标签；等标记消失。
  *   - 打工者：运行在被打开的 /t/topic/<id>，pending 命中时：等数据加载、
  *             前台下滑 N 段（N=重试次数+1）并停留，让 Discourse 记录已读，
  *             完成后清 pending。
@@ -27,7 +28,7 @@
   /* 三个列表，轮换顺序与说明一致 */
   const LIST_URLS = [
     { name: 'latest', url: 'https://linux.do/latest' },
-    { name: 'new',    url: 'https://linux.do/new?subset=topics' },
+    { name: 'new',    url: 'https://linux.do/new' },
     { name: 'unseen', url: 'https://linux.do/unseen' },
   ];
 
@@ -47,13 +48,14 @@
   const isTopicPage = () => roleName() === 'topic-worker';
   const topicId     = () => { const m = location.pathname.match(/^\/t\/topic\/(\d+)/); return m ? m[1] : null; };
 
-  console.log('[ldbot] 脚本已注入 v0.8.0 @', location.href, 'role=' + roleName());
+  console.log('[ldbot] 脚本已注入 v0.10.0 @', location.href, 'role=' + roleName());
 
   /* ------------------------- 可调参数 ------------------------- */
   const CFG = {
     AUTO_START: true,
     ROTATE_MS: 10 * 60 * 1000,      // 三个列表间轮换周期：10 分钟
-    EMPTY_GROW_LIMIT: 3,            // 当前列表连续 N 次“下滑加载后仍无待阅蓝点”即切换列表
+    EMPTY_LIMITS: { new: 1, latest: 5, unseen: 5 },  // 各列表“下滑后仍无待阅蓝点”达 N 次即进入休眠流程
+    EMPTY_COOLDOWN_MS: 5 * 60 * 1000,                 // 无内容触发后的休眠倒计时：5 分钟（期间不扫描，可点“开始”取消）
     GAP_SEC: 10,                    // 上一次打开话题 -> 下一次打开话题 的间隔(秒)，面板可调
     ATTEMPT_SCROLL_PX: 800,         // 每次“下滑固定距离”的基础长度(px)；第 N 次重试会滑 N 倍
     MAX_ATTEMPTS: 4,                // 蓝点未消失的最大重试次数，超过则本次跳过该话题
@@ -71,7 +73,10 @@
 
   /* ------------------------- 存储工具 ------------------------- */
   const P = (k) => 'ldbot:' + k;
-  const K = { running: 'running', pending: 'pending', owner: 'owner', attempt: 'attempt', gap: 'gap' };
+  const K = {
+    running: 'running', pending: 'pending', owner: 'owner', attempt: 'attempt', gap: 'gap',
+    sleep: 'sleep', cancelSleep: 'cancelSleep',
+  };
   const store = {
     get(k)    { try { return localStorage.getItem(P(k)); } catch (e) { return null; } },
     set(k, v) { try { localStorage.setItem(P(k), v); } catch (e) {} },
@@ -82,11 +87,17 @@
   const uid   = () => Math.random().toString(36).slice(2);
 
   /* ------------------------- 列表行筛选 ------------------------- */
-  // “带小蓝点的未读行”判据：tr.unseen-topic（等价于 .topic-post-badges 内含 .new-topic）
+  // “待阅”判据：新话题蓝点 tr.unseen-topic（.topic-post-badges 内 .new-topic）
+  //             或 新回复未读徽章 .topic-post-badges .unread-posts（如“N 个未读帖子”）
+  function rowDotted(tr) {
+    if (tr.classList.contains('unseen-topic')) return true;
+    return !!tr.querySelector('.topic-post-badges .unread-posts');
+  }
+
   function collectRows() {
     const rows = [...document.querySelectorAll('tbody tr[data-topic-id]')];
     return rows
-      .filter((tr) => tr.classList.contains('unseen-topic'))
+      .filter(rowDotted)
       .map((tr) => {
         const id = tr.getAttribute('data-topic-id');
         const a = tr.querySelector('a.title.raw-link.raw-topic-link, a.raw-topic-link');
@@ -98,8 +109,8 @@
 
   function rowStillDotted(id) {
     const tr = [...document.querySelectorAll('tbody tr[data-topic-id]')].find((r) => r.getAttribute('data-topic-id') === String(id));
-    if (!tr) return false;                      // 行已不在(从未看列表消失)= 已处理
-    return tr.classList.contains('unseen-topic');
+    if (!tr) return false;                      // 行已不在(从列表消失)= 已处理
+    return rowDotted(tr);
   }
 
   async function waitRows(timeout = 15000) {
@@ -254,6 +265,7 @@
   let skipSet = new Set();
   let sessionOk = 0, sessionSkip = 0;
   let cycleStartAt = Date.now();
+  let sleepUntil = 0;                          // >now 表示处于“无内容休眠”状态
 
   function setGapSec(v) {
     const s = Math.max(1, Math.round(parseFloat(v) || CFG.GAP_SEC));
@@ -336,25 +348,77 @@
 
       // 当前页没有带蓝点的行了：滑到底部触发加载，算一次“下滑”
       const grew = await growFeed();
-      if (grew && nextCandidate()) { emptyStreak = 0; continue; }   // 加载出了新蓝点
+      if (grew && nextCandidate()) { emptyStreak = 0; continue; }   // 加载出了新待阅蓝点
 
-      // 这次下滑后仍没有待阅蓝点（无论是否加载出新行）
+      // 各列表阈值：new=1，latest/unseen=5
+      const limit = CFG.EMPTY_LIMITS[curKey()] ?? 5;
       emptyStreak++;
-      log('下滑第 ' + emptyStreak + '/' + CFG.EMPTY_GROW_LIMIT + ' 次后仍无待阅蓝点');
-      if (emptyStreak >= CFG.EMPTY_GROW_LIMIT) {
-        log('连续 ' + CFG.EMPTY_GROW_LIMIT + ' 次下滑无待阅蓝点，切换列表');
+      log('下滑第 ' + emptyStreak + '/' + limit + ' 次后仍无待阅蓝点(' + curKey() + ')');
+      if (emptyStreak < limit) { await sleep(1500); continue; }
+
+      // 达到阈值：进入“无内容休眠”——脚本暂停扫描，只留倒计时
+      const r = await doSleep();
+      if (r === 'stop') { releaseOwner(); return; }
+      if (r === 'expire') {
+        log('休眠结束仍无待阅蓝点，切换下一个列表');
         gotoNextList();
         return;
       }
-      await sleep(1500);
+      emptyStreak = 0;                         // 手动取消休眠，从头继续
+      continue;
     }
     releaseOwner();
   }
 
+  /* ---------------- 无内容休眠：暂停扫描，只跑倒计时 ---------------- */
+  function isSleeping() { return isRunning() && sleepUntil > Date.now(); }
+
+  // 点“开始/取消休眠”：通知正在休眠的循环立刻恢复
+  function requestResumeFromSleep() {
+    if (!isSleeping()) return;
+    log('手动取消休眠，继续刷');
+    store.set(K.cancelSleep, '1');
+    updatePanel();
+  }
+
+  async function doSleep() {
+    const mins = CFG.EMPTY_COOLDOWN_MS / 60000;
+    log('无待阅蓝点，脚本休眠 ' + mins + ' 分钟（点“开始/取消休眠”可立即恢复）');
+    sleepUntil = Date.now() + CFG.EMPTY_COOLDOWN_MS;
+    store.set(K.sleep, '1');
+    updatePanel();
+    let res = 'expire';
+    try {
+      while (Date.now() < sleepUntil) {
+        if (!isRunning()) { res = 'stop'; break; }                 // 彻底暂停/停止
+        if (store.get(K.cancelSleep) === '1') { store.del(K.cancelSleep); res = 'cancel'; break; }
+        await sleep(1000);
+        updatePanel();                                             // 刷新休眠倒计时
+      }
+    } finally {
+      sleepUntil = 0;
+      store.del(K.sleep);
+      updatePanel();
+    }
+    return res;
+  }
+
   /* --------------------------- 控制 --------------------------- */
   function log(msg) { console.log('[ldbot]', new Date().toLocaleTimeString(), msg); setStatus(msg); }
-  function startAll() { store.set(K.running, '1'); log('已点开始'); if (isListPage()) runDispatcher(); }
-  function stopAll() { store.set(K.running, '0'); store.del(K.pending); log('已暂停'); updatePanel(); }
+  function startAll() {
+    if (isSleeping()) { requestResumeFromSleep(); return; }  // 休眠中点“开始”= 取消休眠
+    store.set(K.running, '1');
+    log('已点开始');
+    if (isListPage()) runDispatcher();
+  }
+  function stopAll() {
+    store.set(K.running, '0');
+    store.del(K.pending);
+    store.del(K.cancelSleep);
+    sleepUntil = 0;
+    log('已暂停');
+    updatePanel();
+  }
   function resetAll() {
     if (!confirm('重置本次统计与“跳过”记录？')) return;
     skipSet = new Set(); sessionOk = 0; sessionSkip = 0;
@@ -378,7 +442,7 @@
   }
 
   /* ------------------------- 控制面板 ------------------------- */
-  let panel = null, sBtn = null, sCnt = null, sSkp = null, sSta = null, sCtx = null;
+  let panel = null, sBtn = null, sCnt = null, sSkp = null, sSta = null, sCtx = null, sSleepRow = null, sSleep = null;
   function buildPanel() {
     const host = document.createElement('div');
     host.id = 'ldbot-panel';
@@ -397,16 +461,18 @@
                    border-radius:4px; padding:1px 5px; font-size:12px; text-align:right; }
         .btns { display:flex; gap:6px; margin-top:6px; }
         .btns button { flex:1; cursor:pointer; border:0; border-radius:5px; padding:4px 0; font-size:12px; color:#fff; }
-        #ldbot-start { background:#2e8b57; } #ldbot-start.pause { background:#b35900; }
+        #ldbot-start { background:#2e8b57; } #ldbot-start.pause { background:#b35900; } #ldbot-start.sleep { background:#c77f00; }
         #ldbot-reset { background:#7a2020; } #ldbot-test { background:#2f5d8a; }
+        .sleep-row { color:#ffcf6e; }
         .log { margin-top:5px; color:#9aa; font-size:11px; word-break:break-all; max-height:36px; overflow:hidden; }
       </style>
       <div class="box">
-        <div class="t">linux.do 蓝点刷帖 v0.8.0</div>
+        <div class="t">linux.do 蓝点刷帖 v0.10.0</div>
         <div class="r"><span>列表/距轮换</span><span id="ldbot-ctx"></span></div>
         <div class="r"><span>成功(蓝点消失)</span><b id="ldbot-n">0</b></div>
         <div class="r"><span>跳过</span><b id="ldbot-s">0</b></div>
         <div class="r"><span>间隔(秒)</span><input id="ldbot-gap" type="number" min="1" max="600" step="1"></div>
+        <div class="r sleep-row" id="ldbot-sleeprow" style="display:none"><span>无内容休眠</span><b id="ldbot-sleep">--</b></div>
         <div class="btns">
           <button id="ldbot-start"></button>
           <button id="ldbot-test">自检</button>
@@ -421,7 +487,13 @@
     sSkp = shadow.getElementById('ldbot-s');
     sSta = shadow.getElementById('ldbot-log');
     sCtx = shadow.getElementById('ldbot-ctx');
-    sBtn.addEventListener('click', () => (isRunning() ? stopAll() : startAll()));
+    sSleepRow = shadow.getElementById('ldbot-sleeprow');
+    sSleep = shadow.getElementById('ldbot-sleep');
+    sBtn.addEventListener('click', () => {
+      if (isSleeping()) requestResumeFromSleep();   // 休眠中点它 = 取消计时恢复
+      else if (isRunning()) stopAll();
+      else startAll();
+    });
     shadow.getElementById('ldbot-test').addEventListener('click', selfTest);
     shadow.getElementById('ldbot-reset').addEventListener('click', resetAll);
 
@@ -445,13 +517,28 @@
   function updatePanel() {
     if (!sBtn) return;
     const running = isRunning();
-    sBtn.textContent = running ? '暂停' : '开始';
-    sBtn.classList.toggle('pause', running);
+    const sleeping = isSleeping();
+    sBtn.classList.remove('sleep');
+    if (sleeping) {
+      sBtn.textContent = '取消休眠';
+      sBtn.classList.add('sleep');
+    } else {
+      sBtn.textContent = running ? '暂停' : '开始';
+      sBtn.classList.toggle('pause', running);
+    }
     if (sCnt) sCnt.textContent = sessionOk;
     if (sSkp) sSkp.textContent = sessionSkip;
     if (sCtx) {
       const remain = CFG.ROTATE_MS - (Date.now() - cycleStartAt);
       sCtx.textContent = (curKey() || '?') + ' / ' + fmt(remain);
+    }
+    if (sSleepRow) {
+      if (sleeping && sSleep) {
+        sSleepRow.style.display = 'flex';
+        sSleep.textContent = fmt(sleepUntil - Date.now());
+      } else {
+        sSleepRow.style.display = 'none';
+      }
     }
   }
 
