@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         linux.do 话题自动浏览（蓝点刷帖 v2）
 // @namespace    https://linux.do/
-// @version      0.10.0
-// @description  只在“待阅”话题行上工作（新话题蓝点 tr.unseen-topic / .topic-post-badges .new-topic，或新回复未读徽章 .unread-posts）：打开话题标签并切过去等数据加载，再回列表等标记消失+间隔后才开下一个；未消失则回该话题多下滑一段再回来。在 /latest、/new、/unseen 三个列表间自动轮换（/new 空刷 1 次、其余 5 次后触发“无内容休眠”，休眠 5 分钟倒计时，期间可点“开始/取消休眠”立即恢复，到期自动切列表）。
+// @version      0.11.2
+// @description  只在“待阅”话题行上工作（新话题蓝点 tr.unseen-topic / .topic-post-badges .new-topic，或新回复未读徽章 .unread-posts）：打开话题标签并切过去，下滑固定距离读一段就退出，再回列表等标记消失+间隔后才开下一个；不对同一话题重复进入，未消失的交给下一轮列表循环（列表到底即切下一个 URL）。在 /latest、/new、/unseen 三个列表间自动轮换（/new 空刷 1 次、其余 5 次后触发“无内容休眠”，休眠 5 分钟倒计时，期间可点“开始/取消休眠”立即恢复，到期自动切列表）。
 // @author       you
 // @match        https://linux.do/*
 // @run-at       document-idle
@@ -15,9 +15,10 @@
  * 纯页面行为，不判断登录。同脚本两角色靠 localStorage 协作：
  *   - 调度者：运行在三个列表页之一，只处理带“待阅”标记的行(新话题
  *             unseen-topic / .new-topic 或 新回复 .unread-posts)；
- *             轮换 URL；打开/关闭话题标签；等标记消失。
+ *             轮换 URL；打开/关闭话题标签；等标记消失；同一话题每轮只进
+ *             一次，未消失的交给下一轮列表循环，不在同一话题上反复重试。
  *   - 打工者：运行在被打开的 /t/topic/<id>，pending 命中时：等数据加载、
- *             前台下滑 N 段（N=重试次数+1）并停留，让 Discourse 记录已读，
+ *             前台下滑固定距离并停留，让 Discourse 记录已读，
  *             完成后清 pending。
  * 手动打开的话题不受影响。
  * ===================================================================== */
@@ -48,7 +49,7 @@
   const isTopicPage = () => roleName() === 'topic-worker';
   const topicId     = () => { const m = location.pathname.match(/^\/t\/topic\/(\d+)/); return m ? m[1] : null; };
 
-  console.log('[ldbot] 脚本已注入 v0.10.0 @', location.href, 'role=' + roleName());
+  console.log('[ldbot] 脚本已注入 v0.11.2 @', location.href, 'role=' + roleName());
 
   /* ------------------------- 可调参数 ------------------------- */
   const CFG = {
@@ -57,11 +58,9 @@
     EMPTY_LIMITS: { new: 1, latest: 5, unseen: 5 },  // 各列表“下滑后仍无待阅蓝点”达 N 次即进入休眠流程
     EMPTY_COOLDOWN_MS: 5 * 60 * 1000,                 // 无内容触发后的休眠倒计时：5 分钟（期间不扫描，可点“开始”取消）
     GAP_SEC: 10,                    // 上一次打开话题 -> 下一次打开话题 的间隔(秒)，面板可调
-    ATTEMPT_SCROLL_PX: 800,         // 每次“下滑固定距离”的基础长度(px)；第 N 次重试会滑 N 倍
-    MAX_ATTEMPTS: 4,                // 蓝点未消失的最大重试次数，超过则本次跳过该话题
+    ATTEMPT_SCROLL_PX: 800,         // 每次进话题“下滑固定距离”(px)，读一段就走，不滚到底
     DOT_WAIT_MS: 8000,              // 回列表后等待蓝点消失的最长时间（实测约 1s）
     FALLBACK_HOLD_MS: 10000,        // 兜底：打开话题后无论 worker 是否回报，到点即关标签回列表
-    OPEN_TIMEOUT_MS: 30000,         // worker 完成信号的最大等待（正常 8s 内）
     LOAD_TIMEOUT_MS: 20000,         // 帖子内容加载等待上限
     READY_STABLE_MS: 700,           // 帖子数连续稳定多久视为“数据加载完”
     STEP_MIN: 160, STEP_MAX: 380,   // 滚动步长
@@ -74,7 +73,7 @@
   /* ------------------------- 存储工具 ------------------------- */
   const P = (k) => 'ldbot:' + k;
   const K = {
-    running: 'running', pending: 'pending', owner: 'owner', attempt: 'attempt', gap: 'gap',
+    running: 'running', pending: 'pending', owner: 'owner', gap: 'gap',
     sleep: 'sleep', cancelSleep: 'cancelSleep',
   };
   const store = {
@@ -184,9 +183,8 @@
     if (store.get(K.pending) !== id) return;               // 手动打开，不打扰
 
     try {
-      const att = parseInt(store.get(K.attempt) || '0', 10) || 0;
       const ready = await waitTopicReady();
-      if (ready) await humanScrollTo(CFG.ATTEMPT_SCROLL_PX * (att + 1));
+      if (ready) await humanScrollTo(CFG.ATTEMPT_SCROLL_PX);   // 下滑固定距离读一段就走，不滚到底
       else await sleep(rand(1500, 2500));
     } catch (err) {
       console.error('[ldbot] 打工异常 #' + id, err);
@@ -237,20 +235,25 @@
     return false;
   }
 
+  // 每个话题每轮只进一次：下滑固定距离读一段就下一个，不做同一话题的重试循环；
+  // 读一段后即加入 skipSet，本次 url 会话内不再进入（切到下一个 url 后页面刷新、
+  // skipSet 清空，回来再重新处理，此时有新回复的话题会再次带标记，属系统正常逻辑）。
   async function browseRow(row) {
     const t0 = Date.now();
-    for (let att = 0; att < CFG.MAX_ATTEMPTS; att++) {
-      store.set(K.attempt, String(att));
-      const ok = await openAttempt(row);
-      if (!ok) break;
-      if (await waitDotGone(row.id)) {
-        log('✓ 蓝点消失 #' + row.id);
-        return t0;
-      }
-      log('蓝点仍在，第 ' + (att + 1) + ' 次回到话题下滑');
+    const ok = await openAttempt(row);
+    if (!ok) {
+      skipSet.add(row.id);
+      sessionSkip++;
+      log('✗ 打不开标签，本次跳过 #' + row.id);
+      return t0;
     }
-    skipSet.add(row.id);
-    log('✗ 多次尝试蓝点仍在，本次跳过 #' + row.id);
+    skipSet.add(row.id);               // 读一段后本次会话不再进入，避免反复进入同一话题
+    if (await waitDotGone(row.id)) {
+      sessionOk++;
+      log('✓ 蓝点消失 #' + row.id);
+    } else {
+      log('蓝点仍在，本次已读一段，换下一个话题 #' + row.id);
+    }
     return t0;
   }
 
@@ -340,7 +343,6 @@
         await centerCandidate(cand.id);          // 先把该行滚到视口正中
         const t0 = await browseRow(cand);
         if (store.get(K.pending)) store.del(K.pending);
-        if (skipSet.has(cand.id)) sessionSkip++; else sessionOk++;
         updatePanel();
         await paceFrom(t0);
         continue;
@@ -467,7 +469,7 @@
         .log { margin-top:5px; color:#9aa; font-size:11px; word-break:break-all; max-height:36px; overflow:hidden; }
       </style>
       <div class="box">
-        <div class="t">linux.do 蓝点刷帖 v0.10.0</div>
+        <div class="t">linux.do 蓝点刷帖 v0.11.2</div>
         <div class="r"><span>列表/距轮换</span><span id="ldbot-ctx"></span></div>
         <div class="r"><span>成功(蓝点消失)</span><b id="ldbot-n">0</b></div>
         <div class="r"><span>跳过</span><b id="ldbot-s">0</b></div>
